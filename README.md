@@ -9,6 +9,8 @@ Put(key, value)                  Read(key)                ReadKeyRange(start, en
 BatchPut(keys..., values...)     Delete(key)
 ```
 
+Requires Go 1.21 or newer (`min`/`max` builtins); nothing else.
+
 ## Quick start
 
 ```bash
