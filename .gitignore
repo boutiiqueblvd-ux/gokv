@@ -1,0 +1,10 @@
+# build output
+/bin/
+kvd
+kvcli
+kvbench
+
+# runtime state from the demo scripts and manual runs
+/data/
+/.run/
+*.log
