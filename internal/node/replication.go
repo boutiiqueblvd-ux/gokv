@@ -119,6 +119,14 @@ func (n *Node) serveReplication(conn net.Conn, w *proto.Writer, fromSeq uint64) 
 		n.logf("catch-up for %s failed: %v", peer, err)
 		return
 	}
+	// Tell the follower the backlog is drained. Until it sees this it must
+	// allow for long gaps between frames; after it, silence means trouble.
+	if err := writeStatus(w, proto.StatusLive); err != nil {
+		return
+	}
+	if err := w.Flush(); err != nil {
+		return
+	}
 
 	hb := time.NewTicker(n.cfg.HeartbeatInterval)
 	defer hb.Stop()
@@ -248,7 +256,19 @@ func (n *Node) followLoop() {
 		}
 
 		leader := n.LeaderAddr()
-		if n.Role() == Leader || leader == "" || leader == n.cfg.Addr {
+		if n.Role() == Leader {
+			if n.sleep(200 * time.Millisecond) {
+				return
+			}
+			continue
+		}
+		if leader == "" || leader == n.cfg.Addr {
+			// A follower with no leader to stream from -- misconfigured, or
+			// left behind when the leader it knew about vanished. Without this
+			// it would wait forever instead of standing for election.
+			if n.sinceLastContact() > n.cfg.ElectionTimeout {
+				n.startElection()
+			}
 			if n.sleep(200 * time.Millisecond) {
 				return
 			}
@@ -312,19 +332,31 @@ func (n *Node) replicateFrom(addr string) error {
 	if err := w.Flush(); err != nil {
 		return err
 	}
-	n.setLastContact()
+	// Deliberately not marking contact here: a leader that accepts the
+	// connection and then says nothing must not count as reachable, or a hung
+	// leader would keep this node from ever standing for election.
 
 	r := proto.NewReader(conn)
-	idle := 3 * n.cfg.HeartbeatInterval
+	// While catching up the leader is reading its own log and the gap between
+	// frames can be long. Once it says it is live, silence is a fault.
+	idle := max(3*n.cfg.HeartbeatInterval, time.Second)
+	const catchUpIdle = 60 * time.Second
+	caughtUp, greeted := false, false
 	for {
 		select {
 		case <-n.stop:
 			return nil
 		default:
 		}
-		// A snapshot can take a while to arrive; the deadline only needs to be
-		// generous enough to cover the heartbeat gap.
-		conn.SetReadDeadline(time.Now().Add(max(idle, 30*time.Second)))
+		// The leader greets a new follower before it does any work, so the
+		// first frame is owed promptly -- that is what distinguishes a hung
+		// leader from a busy one. Only the frames after the greeting, while
+		// the backlog is being read off disk, get the generous window.
+		deadline := idle
+		if greeted && !caughtUp {
+			deadline = catchUpIdle
+		}
+		conn.SetReadDeadline(time.Now().Add(deadline))
 		frame, err := r.ReadFrame()
 		if err != nil {
 			if err == io.EOF {
@@ -335,9 +367,13 @@ func (n *Node) replicateFrom(addr string) error {
 		if len(frame) == 0 {
 			return errors.New("empty frame from leader")
 		}
+		greeted = true
 		n.setLastContact()
 		switch proto.Status(frame[0]) {
+		case proto.StatusLive:
+			caughtUp = true
 		case proto.StatusHeartbeat:
+			caughtUp = true
 			d := proto.NewDec(frame[1:])
 			leaderEpoch := d.U64()
 			leaderAddr := d.Str()

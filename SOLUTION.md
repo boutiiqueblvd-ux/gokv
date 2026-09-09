@@ -37,7 +37,7 @@ construction:
 | --- | --- |
 | low read latency | one hash lookup, then exactly one `pread`. No level cascade, no bloom filters, no read amplification |
 | random-write throughput | every write is an append; the key distribution is irrelevant. No compaction on the write path, no page splits |
-| bigger than RAM | only keys and a 24-byte locator live in memory. Values are never cached by us |
+| bigger than RAM | only keys and a 32-byte locator live in memory. Values are never cached by us |
 | crash recovery | a forward scan that stops at the first bad checksum, accelerated by hint sidecars |
 
 **Rejected: an LSM tree.** It would have given me sorted data on disk for free,
@@ -67,6 +67,23 @@ I wrote the skip list rather than using a B-tree because it is about 120 lines,
 needs no rebalancing, and the store already serialises index mutations under a
 single lock, so a lock-free variant would have been complexity for nothing.
 
+### Tombstones stay in the index
+
+A delete does not remove the key from the in-memory index; it replaces the
+entry with a tombstone that carries the delete's sequence number. Compaction is
+what finally removes it.
+
+This costs memory — deleted keys occupy index space until the next merge — and
+it buys the invariant everything else leans on. If a delete simply erased the
+key, the index would have no record that it had ever seen a higher sequence for
+it, and an *older* record arriving afterwards would be indistinguishable from a
+new write. "Afterwards" is not hypothetical: recovery walks files in id order
+and a merged file's records are in key order, so an older record genuinely can
+be read after the tombstone that killed it. The same is true of a replication
+stream. This was a live bug, found in review, and the tests that pin it down
+are `TestDeleteIsNotUndoneByAnOlderRecord` and
+`TestRecoveryHonoursSequenceNotFileOrder`.
+
 ### Sequence numbers instead of file ordering
 
 Every record carries a globally monotonic sequence. Recovery resolves duplicate
@@ -84,7 +101,7 @@ decision pays for itself three times:
 
 `-sync always` fsyncs before acknowledging: nothing acknowledged is ever lost,
 at roughly 740 writes/s on this machine's (virtualised) disk. `-sync interval`
-(the default) fsyncs on a 200 ms timer and reaches ~330k writes/s at the engine.
+(the default) fsyncs on a 200 ms timer and reaches ~290k writes/s at the engine.
 That is a three-orders-of-magnitude difference, so it has to be the operator's
 decision, not mine.
 
@@ -153,12 +170,12 @@ Intel i7-14700F, 15 GiB RAM, WSL2 on a virtualised disk. Reproduce with
 
 | benchmark | result | notes |
 | --- | --- | --- |
-| `PutRandom` | 3.0 µs/op — ~330k writes/s | random keys, 128 B values, `-sync interval` |
-| `PutRandomSyncAlways` | 1.36 ms/op — ~740 writes/s | fsync per write; this is the disk, not the code |
-| `BatchPut100` | 84 µs/batch — ~1.19M items/s | one append, one fsync per batch |
-| `GetRandom` | 848 ns/op | single-threaded |
-| `GetParallel` | 189 ns/op — ~5.3M reads/s | 28 threads |
-| `Scan100` | 39.6 µs — ~2.5M keys/s | 100-key range |
+| `PutRandom` | 3.5 µs/op — ~290k writes/s | random keys, 128 B values, `-sync interval` |
+| `PutRandomSyncAlways` | 1.54 ms/op — ~650 writes/s | fsync per write; this is the disk, not the code |
+| `BatchPut100` | 69 µs/batch — ~1.45M items/s | one append, one fsync per batch |
+| `GetRandom` | 832 ns/op | single-threaded |
+| `GetParallel` | 162 ns/op — ~6.2M reads/s | 28 threads |
+| `Scan100` | 38.5 µs — ~2.6M keys/s | 100-key range |
 
 **Over the network** (`cmd/kvbench`, single node, loopback):
 
@@ -172,7 +189,7 @@ Intel i7-14700F, 15 GiB RAM, WSL2 on a virtualised disk. Reproduce with
 | Range ×100 keys, 16 clients | 1.12M items/s | 938 µs | 5.3 ms |
 
 Single-op throughput is bounded by the request/response round trip, not by the
-engine: 848 ns of engine work sits inside a 129 µs round trip. Batching and
+engine: 832 ns of engine work sits inside a 129 µs round trip. Batching and
 range queries, which amortise that round trip, are where the engine's real
 speed shows.
 
@@ -181,9 +198,9 @@ with 15 GiB of RAM:
 
 | | |
 | --- | --- |
-| resident set of the server | **0.64 GiB** for 2.53M live keys |
-| random reads across the whole 16 GiB set | **34k ops/s, p50 713 µs, p99 4.1 ms** |
-| restart with hint files | **8.3 s** to rebuild 2.53M keys from 15.8 GiB |
+| resident set of the server | **0.53 GiB** for 2.53M live keys |
+| random reads across the whole 16 GiB set | **35k ops/s, p50 708 µs, p99 4.1 ms** |
+| restart with hint files | **8.4 s** to rebuild 2.53M keys from 15.8 GiB |
 | restart without hint files (deleted) | 14.8 s |
 | compaction, 36.8% dead | 16 files → 10, 15.8 GiB → 11 GiB, **98 s**, reads served throughout at 32k ops/s |
 
@@ -209,7 +226,7 @@ value size) is what the measurement supports.
 Honest list. Everything here is a real gap, not a rough edge.
 
 **The index must fit in RAM.** Roughly 150 bytes per key (map entry, skip-list
-node, key string, 24-byte locator). 100M keys is about 15 GB of index. Values
+node, key string, 32-byte locator). 100M keys is about 18 GB of index. Values
 of any size are fine; *key count* is the ceiling. This is inherent to Bitcask
 and it is the single biggest architectural limitation. An LSM tree is the fix.
 
@@ -252,7 +269,7 @@ network service.
 node means restarting the others. There is no membership change protocol.
 
 **A single write lock serialises all writers.** Correct and simple, and the
-engine still does 330k writes/s, but group commit (batching concurrent writers
+engine still does 290k writes/s, but group commit (batching concurrent writers
 into one append and one fsync) would help a lot in `-sync always` mode, where
 writers currently queue behind individual fsyncs.
 
@@ -263,7 +280,77 @@ partition scenarios beyond a clean process kill; more than 3 nodes.
 
 ---
 
-## 4. What I would do next, in order
+## 4. What the review pass found
+
+After the first working version I went back over the code hunting for bugs
+rather than adding features. These are the ones that were real, all of them now
+fixed with a regression test that fails without the fix.
+
+**Deleted keys could come back.** The big one. Removing a key from the index on
+delete threw away the sequence number that made the delete authoritative, so an
+older record for that key — arriving out of a merged file during recovery, or
+out of order on a replication stream — was treated as a fresh write. Fixed by
+keeping tombstones in the index (see section 1). Two of the paths that reach it
+are ordinary operation, not exotic failure: a merge racing a concurrent delete,
+and a follower catching up across a merge boundary.
+
+**Compaction could strand the index.** The index was repointed record by record
+as the merge copied them. If the merge then failed part way — a read error, a
+full disk — it deleted its own half-written output files, while index entries
+already pointed into them. Those keys became unreadable until a restart.
+Repointing now happens only after every output file is durable, in one pass, so
+abandoning a merge can never strand anything.
+
+**Compaction and snapshots leaked batch markers.** A `BatchPut` record carries
+"part of a group, only valid once you see the terminator". When compaction
+copies a live record out of a batch whose terminator has since been
+overwritten, or a snapshot ships one record per key, that marker follows it and
+recovery stages the record forever and then discards it — silent data loss on
+the next restart without a hint file. The markers are now stripped whenever a
+record is lifted out of the batch it was written in.
+
+**An aborted range query corrupted the client connection.** Range replies are a
+stream of frames. A caller that stopped early left the rest in the socket, and
+the next request read those leftovers as its answer — a `Read` returning some
+other key's value. The client now marks such a connection unusable and
+reconnects. `TestAbortedRangeDoesNotCorruptTheConnection` catches it; without
+the fix, the assertion fails with a range key answering a point read.
+
+**A hung leader was not detected for a minute.** A follower marked "contact" as
+soon as it connected, so a leader that accepted TCP and then said nothing kept
+its followers waiting indefinitely, and the read deadline was 30 s regardless.
+Contact is now only recorded on a frame actually received, the leader greets a
+new follower before doing any work, and the deadline is tight until the leader
+says it is live and tight again afterwards — generous only while a backlog is
+being read off disk. `TestHungLeaderIsDetected` stands up a listener that
+accepts and never speaks.
+
+**A batch count off the network sized an allocation.** `BatchPut`'s pair count
+was read and used to preallocate before it was checked, so a four-byte field
+could ask a node to reserve tens of gigabytes. It is now validated against the
+bytes the frame actually contains.
+
+**A replicated record was trusted more than a local one.** `ApplyRaw` did not
+apply the length limits the local write path enforces. An empty key is
+especially nasty: recovery reads a zero key length as end-of-file, so a single
+such record would silently truncate everything written after it.
+
+**`Close` raced background compaction.** A merge started by the scheduler was
+not tracked by the wait group, so shutdown could close the files underneath it.
+Shutdown now waits on the compaction lock.
+
+**`STATS` stopped the world.** It called `runtime.ReadMemStats` on every
+request; any client could add GC pauses to everyone else's latency by polling
+it. It reads `runtime/metrics` now.
+
+Also fixed, smaller: nodes started without `-bootstrap` waited forever instead
+of standing for election; orphaned hint files accumulated after compaction; a
+large batch was held in memory twice; the test harness raced the OS for ports
+(nodes can now be handed a pre-bound listener).
+
+---
+
+## 5. What I would do next, in order
 
 1. **Write quorum.** Optional synchronous replication to N followers before
    acknowledging. Closes the acknowledged-write-loss window, which is the most
@@ -281,7 +368,7 @@ partition scenarios beyond a clean process kill; more than 3 nodes.
 
 ---
 
-## 5. Things I changed while building
+## 6. Things I changed while building
 
 - **The index started as a map alone.** I discovered `ReadKeyRange` while
   re-reading the brief and added the skip list rather than sorting per query.

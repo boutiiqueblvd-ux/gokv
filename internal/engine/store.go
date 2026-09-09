@@ -115,8 +115,12 @@ type Store struct {
 	obs   map[uint64]Observer
 	obsID uint64
 
-	live atomic.Int64
-	dead atomic.Int64
+	// live is the byte count of records the index still points at; total is
+	// every byte in the data files. Deriving dead space from the two, rather
+	// than maintaining it incrementally, means the two can never drift.
+	live  atomic.Int64
+	total atomic.Int64
+	nLive atomic.Int64
 
 	nPut, nGet, nDel, nScan, nMiss atomic.Uint64
 
@@ -173,6 +177,12 @@ func (s *Store) recover() error {
 	ids, err := listDataFiles(s.dir)
 	if err != nil {
 		return err
+	}
+	// A hint whose data file was compacted away is dead weight, and a .tmp is
+	// a hint that never finished being written. Neither is ever read, but they
+	// would accumulate forever.
+	if err := removeOrphanHints(s.dir, ids); err != nil {
+		s.logf("could not tidy stale hint files: %v", err)
 	}
 
 	var (
@@ -244,16 +254,11 @@ func (s *Store) recover() error {
 		}
 	}
 
-	var live int64
-	for _, n := range s.keys {
-		live += int64(n.ent.size)
-	}
-	s.live.Store(live)
-	if d := totalBytes - live; d > 0 {
-		s.dead.Store(d)
-	}
-	s.logf("recovered %d keys from %d files (%.1f MiB) in %s",
-		len(s.keys), len(ids), float64(totalBytes)/(1<<20), time.Since(start).Round(time.Millisecond))
+	s.total.Store(totalBytes)
+	s.recountLocked()
+	s.logf("recovered %d keys (%d tombstones) from %d files (%.1f MiB) in %s",
+		s.nLive.Load(), int64(len(s.keys))-s.nLive.Load(), len(ids),
+		float64(totalBytes)/(1<<20), time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -302,21 +307,15 @@ func (s *Store) scanIntoIndex(id uint32, maxSeq *uint64) (int64, error) {
 
 // applyRecovered installs an entry if it is newer than what the index holds.
 // Comparing sequence numbers rather than file order is what lets merged files
-// carry fresh ids without resurrecting stale values.
+// carry fresh ids without resurrecting stale values -- and why a tombstone is
+// recorded rather than being turned into a deletion.
 func (s *Store) applyRecovered(key []byte, e entry, tomb bool) {
+	e.tomb = tomb
 	if n, ok := s.keys[string(key)]; ok {
 		if n.ent.seq >= e.seq {
 			return
 		}
-		if tomb {
-			delete(s.keys, n.key)
-			s.order.remove(n.key)
-			return
-		}
 		n.ent = e
-		return
-	}
-	if tomb {
 		return
 	}
 	k := string(key)
@@ -402,9 +401,10 @@ func (s *Store) Delete(key []byte) error {
 		return err
 	}
 	s.mu.RLock()
-	_, ok := s.keys[string(key)]
+	n, ok := s.keys[string(key)]
+	live := ok && !n.ent.tomb
 	s.mu.RUnlock()
-	if !ok {
+	if !live {
 		return ErrKeyNotFound
 	}
 	s.wmu.Lock()
@@ -449,6 +449,7 @@ func (s *Store) writeLocked(recs []record) error {
 		return err
 	}
 	af.size.Store(base + int64(len(buf)))
+	s.total.Add(int64(len(buf)))
 	s.dirty = true
 	if s.opts.SyncMode == SyncAlways {
 		if err := af.f.Sync(); err != nil {
@@ -474,31 +475,43 @@ func (s *Store) writeLocked(recs []record) error {
 }
 
 // indexApplyLocked is the single place where the index changes. Callers hold mu.
+//
+// A record that is older than what the index already holds is dropped, which
+// is what makes replication and recovery order-insensitive. A tombstone is
+// stored like any other record: only compaction removes a key from the index.
 func (s *Store) indexApplyLocked(key []byte, e entry, tomb bool) {
+	e.tomb = tomb
 	if n, ok := s.keys[string(key)]; ok {
 		if n.ent.seq >= e.seq {
-			s.dead.Add(int64(e.size)) // arrived out of order: already stale
-			return
+			return // arrived out of order: already stale
 		}
-		s.dead.Add(int64(n.ent.size))
-		s.live.Add(-int64(n.ent.size))
-		if tomb {
-			delete(s.keys, n.key)
-			s.order.remove(n.key)
-			s.dead.Add(int64(e.size))
-			return
+		if !n.ent.tomb {
+			s.live.Add(-int64(n.ent.size))
+			s.nLive.Add(-1)
 		}
 		n.ent = e
+	} else {
+		k := string(key)
+		s.keys[k] = s.order.insert(k, e)
+	}
+	if !tomb {
 		s.live.Add(int64(e.size))
-		return
+		s.nLive.Add(1)
 	}
-	if tomb {
-		s.dead.Add(int64(e.size))
-		return
+}
+
+// recountLocked rebuilds the live counters from the index. Callers hold mu for
+// writing, or hold it exclusively by virtue of not having published the store yet.
+func (s *Store) recountLocked() {
+	var live, n int64
+	for _, node := range s.keys {
+		if !node.ent.tomb {
+			live += int64(node.ent.size)
+			n++
+		}
 	}
-	k := string(key)
-	s.keys[k] = s.order.insert(k, e)
-	s.live.Add(int64(e.size))
+	s.live.Store(live)
+	s.nLive.Store(n)
 }
 
 func (s *Store) maybeRotateLocked(incoming int64) error {
@@ -558,7 +571,7 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 			e = n.ent
 		}
 		s.mu.RUnlock()
-		if !ok {
+		if !ok || e.tomb {
 			s.nMiss.Add(1)
 			return nil, ErrKeyNotFound
 		}
@@ -627,22 +640,30 @@ func (s *Store) Scan(start, end []byte, limit int, fn func(key, value []byte) er
 	)
 	for {
 		refs = refs[:0]
+		examined, atEnd := 0, false
 		s.mu.RLock()
 		for n := s.order.seek(cursor); n != nil; n = n.next[0] {
 			if exclusive && n.key == cursor {
 				continue
 			}
 			if endKey != "" && n.key > endKey {
+				atEnd = true
 				break
 			}
-			refs = append(refs, ref{key: n.key, e: n.ent})
-			if len(refs) == scanChunk {
+			// The cursor advances over tombstones too, so that a long run of
+			// deleted keys is not mistaken for the end of the index.
+			cursor, exclusive = n.key, true
+			examined++
+			if !n.ent.tomb {
+				refs = append(refs, ref{key: n.key, e: n.ent})
+			}
+			if len(refs) == scanChunk || examined == scanChunk*8 {
 				break
 			}
 		}
 		s.mu.RUnlock()
 
-		if len(refs) == 0 {
+		if examined == 0 {
 			return nil
 		}
 		for _, r := range refs {
@@ -667,8 +688,7 @@ func (s *Store) Scan(start, end []byte, limit int, fn func(key, value []byte) er
 				return nil
 			}
 		}
-		cursor, exclusive = refs[len(refs)-1].key, true
-		if len(refs) < scanChunk {
+		if atEnd {
 			return nil
 		}
 	}
@@ -684,7 +704,7 @@ func (s *Store) reread(key string) ([]byte, error) {
 		e = n.ent
 	}
 	s.mu.RUnlock()
-	if !ok {
+	if !ok || e.tomb {
 		return nil, ErrKeyNotFound
 	}
 	return s.readValue(e)
@@ -747,14 +767,21 @@ func (s *Store) Seq() uint64 {
 
 func (s *Store) MergeSeq() uint64 { return s.mergeSeq.Load() }
 
-func (s *Store) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.keys)
+// deadBytes is everything on disk the index no longer points at: superseded
+// records, tombstones, and the values they shadow.
+func (s *Store) deadBytes() int64 {
+	if d := s.total.Load() - s.live.Load(); d > 0 {
+		return d
+	}
+	return 0
 }
+
+// Len reports the number of live keys, excluding tombstones awaiting compaction.
+func (s *Store) Len() int { return int(s.nLive.Load()) }
 
 type Stats struct {
 	Keys        int
+	Tombstones  int
 	Files       int
 	LiveBytes   int64
 	DeadBytes   int64
@@ -770,18 +797,19 @@ type Stats struct {
 
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
-	keys := len(s.keys)
+	indexed := len(s.keys)
 	s.mu.RUnlock()
 	s.fmu.RLock()
 	files := len(s.files)
 	s.fmu.RUnlock()
-	live, dead := s.live.Load(), s.dead.Load()
+	live, dead := s.live.Load(), s.deadBytes()
 	var ratio float64
 	if live+dead > 0 {
 		ratio = float64(dead) / float64(live+dead)
 	}
 	return Stats{
-		Keys: keys, Files: files, LiveBytes: live, DeadBytes: dead,
+		Keys: int(s.nLive.Load()), Tombstones: indexed - int(s.nLive.Load()),
+		Files: files, LiveBytes: live, DeadBytes: dead,
 		Seq: s.Seq(), Puts: s.nPut.Load(), Gets: s.nGet.Load(),
 		Deletes: s.nDel.Load(), Scans: s.nScan.Load(), Misses: s.nMiss.Load(),
 		Reclaimable: ratio, Compacting: s.compacting.Load(),
@@ -805,6 +833,13 @@ func (s *Store) Close() error {
 	}
 	s.wmu.Unlock()
 	s.wg.Wait()
+
+	// A background merge is not tracked by the wait group, and it is holding
+	// file handles we are about to close. Taking the compaction lock waits for
+	// any in-flight merge; one that has not started yet will see closed and
+	// return immediately.
+	s.compactMu.Lock()
+	s.compactMu.Unlock()
 
 	s.closeFiles()
 	releaseLock(s.lock, s.dir)
@@ -863,8 +898,18 @@ func (s *Store) ApplyRaw(raw []byte) (uint64, error) {
 		if off+recordHeaderSize > len(raw) {
 			return 0, ErrCorrupt
 		}
-		size := int(encodedSize(int(le32(raw[off+21:])), int(le32(raw[off+25:]))))
-		if off+size > len(raw) {
+		// Lengths come off the network, so they are widened before they are
+		// added up and checked against the same limits the local write path
+		// enforces. An empty key in particular is a poison pill: recovery
+		// treats a zero key length as the end of a file, so one would silently
+		// truncate everything written after it.
+		keyLen := int64(le32(raw[off+21:]))
+		valLen := int64(le32(raw[off+25:]))
+		if keyLen == 0 || keyLen > MaxKeySize || valLen > MaxValueSize {
+			return 0, ErrCorrupt
+		}
+		size := int(int64(recordHeaderSize) + keyLen + valLen)
+		if size > len(raw)-off {
 			return 0, ErrCorrupt
 		}
 		rec, err := decodeRecord(raw[off : off+size])
@@ -920,7 +965,8 @@ func (s *Store) Reset() error {
 	s.fmu.Unlock()
 
 	s.live.Store(0)
-	s.dead.Store(0)
+	s.total.Store(0)
+	s.nLive.Store(0)
 	s.seq = 0
 	s.mergeSeq.Store(0)
 	writeManifest(s.dir, 0)

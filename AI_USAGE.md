@@ -91,6 +91,38 @@ unforgiving. I did not find any of these by reading the code. The race
 detector, a concurrency stress test, and a timeout found all of them, which is
 why I front-loaded those rather than reviewing more carefully.
 
+## The review pass, and what it says about AI-written code
+
+Once it all worked I stopped adding features and went looking for bugs on
+purpose — reasoning about invariants rather than asking the model to review its
+own output, which in my experience produces agreeable nonsense. Section 4 of
+SOLUTION.md lists what came out. The most instructive one:
+
+> A delete removed the key from the index. That is the obvious implementation,
+> it passes every test you would naturally write, and it is wrong — because
+> removing the key also discards the sequence number that made the delete
+> authoritative. An older record for that key arriving afterwards then looks
+> like a new write. And "afterwards" happens in normal operation: recovery
+> walks files in id order while a merged file's records are in key order.
+
+Nothing about that code looks suspicious. The bug lives in the interaction
+between three components the model wrote at different times, each locally
+correct. I found it by asking "what order can records reach this function in,
+and does the code depend on that order?" — and then writing the test before the
+fix, so I could watch it fail.
+
+That is the thing I would tell someone starting a build like this: the model's
+failures are not in the lines, they are in the seams. My existing test
+`TestApplyRawIsIdempotentAndOrderInsensitive` had even applied the records in an
+order that *contained* the bug, and passed anyway, because a later replay
+happened to repair the damage. A test that exercises a bug is not the same as a
+test that detects one.
+
+Every fix in that pass landed with a regression test, and I checked each test by
+reverting the fix and watching it fail — for the resurrection bug, the connection
+desync, and the batch-marker loss. A regression test you have never seen fail is
+a guess.
+
 ## How I validated
 
 - `go test -race -count=3 ./...` — the engine's concurrency test runs mixed

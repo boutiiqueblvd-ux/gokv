@@ -15,19 +15,36 @@ import (
 	"gokv/client"
 	"gokv/internal/engine"
 	"gokv/internal/node"
+	"gokv/internal/proto"
 )
 
-// freePort reserves an address by binding and immediately releasing it. Nodes
-// need to know their own advertised address up front, so ":0" is not an option.
-func freeAddr(t *testing.T) string {
+// reserveAddr binds a port and keeps it. Nodes need to know their advertised
+// address up front, so ":0" is not an option, and releasing the port before
+// handing the address over would let anything -- including an outbound
+// connection's ephemeral port -- take it first.
+func reserveAddr(t *testing.T) (string, net.Listener) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := l.Addr().String()
-	l.Close()
-	return addr
+	return l.Addr().String(), l
+}
+
+// relisten reclaims an address a stopped node was using.
+func relisten(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l, err := net.Listen("tcp", addr)
+		if err == nil {
+			return l
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("could not rebind %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 type cluster struct {
@@ -36,6 +53,7 @@ type cluster struct {
 	dirs  []string
 	nodes []*node.Node
 	cfgs  []node.Config
+	lns   []net.Listener // reserved up front, handed to the node on start
 }
 
 func newCluster(t *testing.T, size int) *cluster {
@@ -43,7 +61,9 @@ func newCluster(t *testing.T, size int) *cluster {
 	c := &cluster{t: t}
 	root := t.TempDir()
 	for i := 0; i < size; i++ {
-		c.addrs = append(c.addrs, freeAddr(t))
+		addr, ln := reserveAddr(t)
+		c.addrs = append(c.addrs, addr)
+		c.lns = append(c.lns, ln)
 		c.dirs = append(c.dirs, filepath.Join(root, fmt.Sprintf("n%d", i)))
 	}
 	for i := 0; i < size; i++ {
@@ -81,8 +101,15 @@ func testLogger(t *testing.T, id string) *log.Logger {
 
 func (c *cluster) start(i int) *node.Node {
 	c.t.Helper()
-	n, err := node.New(c.cfgs[i])
+	cfg := c.cfgs[i]
+	if c.lns[i] != nil {
+		cfg.Listener, c.lns[i] = c.lns[i], nil
+	} else {
+		cfg.Listener = relisten(c.t, cfg.Addr)
+	}
+	n, err := node.New(cfg)
 	if err != nil {
+		cfg.Listener.Close()
 		c.t.Fatalf("node %d: %v", i, err)
 	}
 	if err := n.Start(); err != nil {
@@ -466,6 +493,7 @@ func TestServerCapsRangeResults(t *testing.T) {
 	// Restart the single node with a deliberately small cap.
 	cfg := c.cfgs[0]
 	cfg.MaxRangeResults = 10
+	cfg.Listener = relisten(t, cfg.Addr)
 	n, err := node.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -492,4 +520,225 @@ func TestServerCapsRangeResults(t *testing.T) {
 	if len(got) != 10 {
 		t.Fatalf("server cap not applied: %d pairs returned", len(got))
 	}
+}
+
+// A range reply is a stream of frames. A caller that gives up half way through
+// leaves the rest of it in flight, and the next request on that connection
+// would otherwise read those leftovers as its own answer.
+func TestAbortedRangeDoesNotCorruptTheConnection(t *testing.T) {
+	c := newCluster(t, 1)
+	cl := c.client()
+
+	// Enough data that the reply spans several protocol chunks.
+	value := make([]byte, 1024)
+	for i := range value {
+		value[i] = 'v'
+	}
+	keys := make([][]byte, 0, 200)
+	vals := make([][]byte, 0, 200)
+	for i := 0; i < 2000; i++ {
+		keys = append(keys, []byte(fmt.Sprintf("k%06d", i)))
+		vals = append(vals, value)
+		if len(keys) == 200 {
+			if err := cl.BatchPut(keys, vals); err != nil {
+				t.Fatal(err)
+			}
+			keys, vals = keys[:0], vals[:0]
+		}
+	}
+	if err := cl.Put([]byte("sentinel"), []byte("intact")); err != nil {
+		t.Fatal(err)
+	}
+
+	giveUp := errors.New("caller stopped early")
+	seen := 0
+	err := cl.ScanKeyRange([]byte("k"), []byte("l"), 0, func(k, v []byte) error {
+		seen++
+		return giveUp
+	})
+	if !errors.Is(err, giveUp) {
+		t.Fatalf("aborted scan returned %v, want the caller's error", err)
+	}
+	if seen != 1 {
+		t.Fatalf("callback ran %d times after aborting, want 1", seen)
+	}
+
+	// The next requests must be answered correctly, not with leftover frames.
+	for i := 0; i < 3; i++ {
+		v, err := cl.Read([]byte("sentinel"))
+		if err != nil || string(v) != "intact" {
+			t.Fatalf("request %d after an aborted scan: %q, %v", i, v, err)
+		}
+	}
+	got, err := cl.ReadKeyRange([]byte("k000000"), []byte("k000009"), 0)
+	if err != nil {
+		t.Fatalf("range after an aborted scan: %v", err)
+	}
+	if len(got) != 10 {
+		t.Fatalf("range after an aborted scan returned %d pairs, want 10", len(got))
+	}
+}
+
+// A count field arriving off the network sizes an allocation, so it has to be
+// checked against what the frame can actually hold.
+func TestServerRejectsImpossibleBatchCount(t *testing.T) {
+	c := newCluster(t, 1)
+
+	conn, err := net.Dial("tcp", c.addrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	e := proto.NewEnc(byte(proto.OpBatchPut), 8)
+	e.U32(0xFFFFFFF0) // claims four billion pairs in an 8-byte body
+	w := proto.NewWriter(conn)
+	if err := w.WriteFrame(e.B); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := proto.NewReader(conn).ReadFrame()
+	if err != nil {
+		t.Fatalf("server did not answer a malformed batch: %v", err)
+	}
+	if proto.Status(frame[0]) != proto.StatusError {
+		t.Fatalf("malformed batch got status %#x, want an error", frame[0])
+	}
+
+	// And the node must still be serving.
+	cl := c.clientFor(0)
+	if err := cl.Put([]byte("still"), []byte("alive")); err != nil {
+		t.Fatalf("node unusable after a malformed frame: %v", err)
+	}
+}
+
+// Nodes started without -bootstrap must still converge on a leader instead of
+// waiting for one that will never appear.
+func TestClusterWithoutBootstrapElectsALeader(t *testing.T) {
+	root := t.TempDir()
+	addrs := make([]string, 3)
+	lns := make([]net.Listener, 3)
+	for i := range addrs {
+		addrs[i], lns[i] = reserveAddr(t)
+	}
+	nodes := make([]*node.Node, 0, 3)
+	for i, addr := range addrs {
+		n, err := node.New(node.Config{
+			ID:       "n" + strconv.Itoa(i),
+			Addr:     addr,
+			Dir:      filepath.Join(root, "n"+strconv.Itoa(i)),
+			Peers:    addrs,
+			Listener: lns[i],
+			// No Bootstrap, and no Leader: nobody has been told who leads.
+			HeartbeatInterval: 100 * time.Millisecond,
+			ElectionTimeout:   400 * time.Millisecond,
+			Logger:            testLogger(t, "n"+strconv.Itoa(i)),
+			Engine:            engine.Options{SyncMode: engine.SyncNever, CompactionInterval: time.Hour},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		nodes = append(nodes, n)
+	}
+
+	eventually(t, 15*time.Second, "exactly one node to take leadership", func() bool {
+		leaders := 0
+		for _, n := range nodes {
+			if n.Role() == node.Leader {
+				leaders++
+			}
+		}
+		return leaders == 1
+	})
+
+	cl, err := client.New(addrs, client.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	eventually(t, 10*time.Second, "the elected leader to accept writes", func() bool {
+		return cl.Put([]byte("elected"), []byte("ok")) == nil
+	})
+}
+
+// A leader that is hung rather than dead still accepts TCP connections and
+// then says nothing. Followers must notice the silence; if merely reaching the
+// socket counted as contact, they would wait for it forever.
+func TestHungLeaderIsDetected(t *testing.T) {
+	// A stand-in leader: it accepts, holds the connection, and never speaks.
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	held := make(chan net.Conn, 8)
+	go func() {
+		for {
+			conn, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case held <- conn:
+			default:
+				conn.Close()
+			}
+		}
+	}()
+
+	root := t.TempDir()
+	addrs := make([]string, 3)
+	lns := make([]net.Listener, 3)
+	addrs[0] = silent.Addr().String()
+	for i := 1; i < 3; i++ {
+		addrs[i], lns[i] = reserveAddr(t)
+	}
+	nodes := make([]*node.Node, 0, 2)
+	for i := 1; i < 3; i++ {
+		n, err := node.New(node.Config{
+			ID:                "n" + strconv.Itoa(i),
+			Addr:              addrs[i],
+			Dir:               filepath.Join(root, "n"+strconv.Itoa(i)),
+			Peers:             addrs,
+			Listener:          lns[i],
+			Leader:            addrs[0], // the silent one
+			HeartbeatInterval: 100 * time.Millisecond,
+			ElectionTimeout:   500 * time.Millisecond,
+			Logger:            testLogger(t, "n"+strconv.Itoa(i)),
+			Engine:            engine.Options{SyncMode: engine.SyncNever, CompactionInterval: time.Hour},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		nodes = append(nodes, n)
+	}
+
+	eventually(t, 20*time.Second, "a follower to give up on the silent leader", func() bool {
+		for _, n := range nodes {
+			if n.Role() == node.Leader {
+				return true
+			}
+		}
+		return false
+	})
+
+	cl, err := client.New(addrs[1:], client.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	eventually(t, 10*time.Second, "the new leader to accept writes", func() bool {
+		return cl.Put([]byte("past-the-hang"), []byte("ok")) == nil
+	})
 }

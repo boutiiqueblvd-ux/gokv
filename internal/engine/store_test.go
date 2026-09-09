@@ -622,3 +622,286 @@ func dirSize(t *testing.T, dir string) int64 {
 	}
 	return total
 }
+
+// A BatchPut's terminator record can be superseded while the earlier records
+// of the same batch are still live. Compaction then copies orphaned batch
+// members into the merged file; if it kept their batch markers, recovery would
+// stage them forever and throw them away.
+func TestCompactionDropsBatchMarkersFromOrphanedRecords(t *testing.T) {
+	opts := testOpts(t)
+	opts.MaxFileSize = 1 << 20
+	s := open(t, opts)
+
+	keys := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
+	vals := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
+	if err := s.BatchPut(keys, vals); err != nil {
+		t.Fatal(err)
+	}
+	// Kill the terminator: b3 was the last record of the batch.
+	mustPut(t, s, "b3", "replaced")
+	// Give the merge something to do and something to keep.
+	for i := 0; i < 50; i++ {
+		mustPut(t, s, fmt.Sprintf("f%02d", i), "v")
+		mustPut(t, s, fmt.Sprintf("f%02d", i), "v2")
+	}
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	s.Close()
+
+	// Force the scan path, which is where the batch markers matter.
+	hints, _ := filepath.Glob(filepath.Join(opts.Dir, "*.hint"))
+	for _, h := range hints {
+		if err := os.Remove(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s2 := open(t, opts)
+	mustGet(t, s2, "b1", "one")
+	mustGet(t, s2, "b2", "two")
+	mustGet(t, s2, "b3", "replaced")
+}
+
+// The same hazard on the replication path: a snapshot ships one record per
+// key, so a batch member arrives at the follower without its terminator.
+func TestSnapshotRecordsCarryNoBatchMarkers(t *testing.T) {
+	srcOpts, dstOpts := testOpts(t), testOpts(t)
+	dstOpts.MaxFileSize = 1 << 20
+	src := open(t, srcOpts)
+
+	keys := [][]byte{[]byte("k1"), []byte("k2"), []byte("k3")}
+	vals := [][]byte{[]byte("a"), []byte("b"), []byte("c")}
+	if err := src.BatchPut(keys, vals); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := open(t, dstOpts)
+	if err := src.SnapshotRecords(func(raw []byte) error {
+		_, err := dst.ApplyRaw(raw)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range keys {
+		mustGet(t, dst, string(keys[i]), string(vals[i]))
+	}
+	dst.Close()
+
+	hints, _ := filepath.Glob(filepath.Join(dstOpts.Dir, "*.hint"))
+	for _, h := range hints {
+		os.Remove(h)
+	}
+	dst2 := open(t, dstOpts)
+	if dst2.Len() != 3 {
+		t.Fatalf("replica kept %d keys across a restart, want 3", dst2.Len())
+	}
+	for i := range keys {
+		mustGet(t, dst2, string(keys[i]), string(vals[i]))
+	}
+}
+
+// Records arriving from another node are not produced by our own validated
+// write path, so ApplyRaw has to police them itself.
+func TestApplyRawRejectsMalformedRecords(t *testing.T) {
+	s := open(t, testOpts(t))
+
+	// A well-formed record, used as the baseline.
+	good := appendRecord(nil, &record{ts: 1, seq: 1, key: []byte("k"), value: []byte("v")})
+	if _, err := s.ApplyRaw(good); err != nil {
+		t.Fatalf("valid record rejected: %v", err)
+	}
+	mustGet(t, s, "k", "v")
+
+	// An empty key would be read back as end-of-file by recovery, silently
+	// truncating everything written after it.
+	empty := appendRecord(nil, &record{ts: 1, seq: 2, key: []byte{}, value: []byte("v")})
+	if _, err := s.ApplyRaw(empty); err == nil {
+		t.Fatal("a record with an empty key was accepted")
+	}
+
+	for name, raw := range map[string][]byte{
+		"truncated header": good[:10],
+		"truncated body":   good[:len(good)-1],
+		"flipped bit":      flip(good),
+	} {
+		if _, err := s.ApplyRaw(raw); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+
+	// A rejected record must leave the store usable and its log intact.
+	mustPut(t, s, "after", "ok")
+	s.Close()
+	s2, err := Open(Options{Dir: s.dir, SyncMode: SyncNever, MaxFileSize: 4 << 10,
+		CompactionInterval: time.Hour, Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	mustGet(t, s2, "k", "v")
+	mustGet(t, s2, "after", "ok")
+}
+
+func flip(b []byte) []byte {
+	out := append([]byte(nil), b...)
+	out[len(out)-1] ^= 0xFF
+	return out
+}
+
+// A delete must stay a delete even when an older record for the same key is
+// applied afterwards. Records reach recovery in file order and reach a
+// follower in network order, neither of which is sequence order.
+func TestDeleteIsNotUndoneByAnOlderRecord(t *testing.T) {
+	src := open(t, testOpts(t))
+	var stream [][]byte
+	cancel := src.AddObserver(func(seq uint64, raw []byte) {
+		stream = append(stream, append([]byte(nil), raw...))
+	})
+	mustPut(t, src, "k", "value") // seq 1
+	if err := src.Delete([]byte("k")); err != nil {
+		t.Fatal(err)
+	} // seq 2
+	cancel()
+
+	dst := open(t, testOpts(t))
+	// The tombstone arrives first, the value it supersedes second.
+	if _, err := dst.ApplyRaw(stream[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.ApplyRaw(stream[0]); err != nil {
+		t.Fatal(err)
+	}
+	mustMiss(t, dst, "k")
+}
+
+// The same hazard reached through recovery: compaction can copy a live record
+// into a high-numbered merged file while a concurrent delete puts the
+// tombstone in a lower-numbered one. Recovery walks files in id order, so it
+// meets the tombstone first and the value it deleted second.
+func TestRecoveryHonoursSequenceNotFileOrder(t *testing.T) {
+	opts := testOpts(t)
+	opts.MaxFileSize = 1 << 30
+	s := open(t, opts)
+	mustPut(t, s, "k", "v1")
+	mustPut(t, s, "other", "keep")
+	if err := s.Delete([]byte("k")); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// Lift the superseded record out of the log...
+	ids, err := listDataFiles(opts.Dir)
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("no data files: %v", err)
+	}
+	var stale []byte
+	if _, err := scanFile(dataPath(opts.Dir, ids[0]), func(pos int64, raw []byte, r *record) error {
+		if string(r.key) == "k" && !r.tombstone() {
+			stale = append([]byte(nil), raw...)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stale == nil {
+		t.Fatal("could not find the superseded record")
+	}
+	// ...and plant it in a file that sorts after the one holding the tombstone,
+	// exactly as a merge racing a delete would.
+	newID := ids[len(ids)-1] + 1
+	if err := os.WriteFile(dataPath(opts.Dir, newID), stale, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := open(t, opts)
+	mustMiss(t, s2, "k")
+	mustGet(t, s2, "other", "keep")
+	if s2.Len() != 1 {
+		t.Fatalf("%d live keys after recovery, want 1", s2.Len())
+	}
+}
+
+// Tombstones live in the index so the rule above can be applied, so compaction
+// has to be what removes them -- otherwise the index grows forever.
+func TestCompactionForgetsTombstones(t *testing.T) {
+	opts := testOpts(t)
+	opts.MaxFileSize = 8 << 10
+	s := open(t, opts)
+
+	for i := 0; i < 100; i++ {
+		mustPut(t, s, fmt.Sprintf("k%03d", i), "value")
+	}
+	for i := 0; i < 50; i++ {
+		if err := s.Delete([]byte(fmt.Sprintf("k%03d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := s.Stats()
+	if st.Keys != 50 || st.Tombstones != 50 {
+		t.Fatalf("before compaction: %d keys, %d tombstones; want 50 and 50", st.Keys, st.Tombstones)
+	}
+
+	if err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	st = s.Stats()
+	if st.Keys != 50 || st.Tombstones != 0 {
+		t.Fatalf("after compaction: %d keys, %d tombstones; want 50 and 0", st.Keys, st.Tombstones)
+	}
+	for i := 0; i < 100; i++ {
+		k := fmt.Sprintf("k%03d", i)
+		if i < 50 {
+			mustMiss(t, s, k)
+		} else {
+			mustGet(t, s, k, "value")
+		}
+	}
+	s.Close()
+
+	s2 := open(t, opts)
+	if s2.Stats().Tombstones != 0 {
+		t.Fatalf("tombstones came back after a restart: %+v", s2.Stats())
+	}
+	for i := 0; i < 50; i++ {
+		mustMiss(t, s2, fmt.Sprintf("k%03d", i))
+	}
+}
+
+// A run of deleted keys longer than the scan chunk must not look like the end
+// of the index.
+func TestRangeCrossesLongRunsOfDeletedKeys(t *testing.T) {
+	opts := testOpts(t)
+	opts.MaxFileSize = 1 << 20
+	s := open(t, opts)
+
+	const n = 3000
+	for i := 0; i < n; i++ {
+		mustPut(t, s, fmt.Sprintf("k%05d", i), "v")
+	}
+	// Delete far more consecutive keys than one scan chunk holds.
+	for i := 0; i < n-40; i++ {
+		if err := s.Delete([]byte(fmt.Sprintf("k%05d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.ScanSlice(nil, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 40 {
+		t.Fatalf("scan across %d tombstones returned %d pairs, want 40", n-40, len(got))
+	}
+	if string(got[0].Key) != fmt.Sprintf("k%05d", n-40) {
+		t.Fatalf("first surviving key is %q", got[0].Key)
+	}
+
+	// And the same through a snapshot, which walks the index the same way.
+	count := 0
+	if err := s.SnapshotRecords(func(raw []byte) error { count++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if count != 40 {
+		t.Fatalf("snapshot shipped %d records, want 40", count)
+	}
+}

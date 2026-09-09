@@ -44,7 +44,7 @@ func (s *Store) shouldCompact() bool {
 	if files < 2 {
 		return false
 	}
-	live, dead := s.live.Load(), s.dead.Load()
+	live, dead := s.live.Load(), s.deadBytes()
 	if live+dead == 0 {
 		return false
 	}
@@ -141,9 +141,19 @@ func (s *Store) Compact() error {
 		e   entry
 	}
 	items := make([]item, 0, 1024)
+	// Tombstones in the merge set are about to stop existing on disk. Once no
+	// older file survives there is nothing left for them to shadow, so their
+	// index entries can be forgotten too -- which is the only thing that stops
+	// the graveyard growing without bound.
+	var retired []item
 	s.mu.RLock()
 	s.order.scan("", "", func(n *slnode) bool {
-		if inMerge[n.ent.fileID] {
+		if !inMerge[n.ent.fileID] {
+			return true
+		}
+		if n.ent.tomb {
+			retired = append(retired, item{key: n.key, e: n.ent})
+		} else {
 			items = append(items, item{key: n.key, e: n.ent})
 		}
 		return true
@@ -189,7 +199,12 @@ func (s *Store) Compact() error {
 		s.fmu.Unlock()
 	}
 
-	for _, it := range items {
+	// Phase one: copy the live records out. The index is deliberately left
+	// alone until every output file is durable, so that abandoning the merge
+	// here can delete the half-written outputs without stranding an index
+	// entry that points into one of them.
+	moved := make([]entry, len(items))
+	for i, it := range items {
 		s.fmu.RLock()
 		src := s.files[it.e.fileID]
 		if src == nil {
@@ -210,6 +225,8 @@ func (s *Store) Compact() error {
 			cleanup()
 			return err
 		}
+		// A merged record is no longer part of the batch it was written in.
+		buf = clearBatchFlags(buf)
 		if out == nil || out.size.Load()+int64(len(buf)) > s.opts.MaxFileSize {
 			if err := newOut(); err != nil {
 				cleanup()
@@ -223,19 +240,12 @@ func (s *Store) Compact() error {
 		}
 		out.size.Add(int64(len(buf)))
 		newEnt := entry{pos: pos, seq: rec.seq, fileID: out.id, size: uint32(len(buf))}
-		if err := hw.add(rec.key, newEnt, rec.flags); err != nil {
+		if err := hw.add(rec.key, newEnt, buf[20]); err != nil {
 			cleanup()
 			return err
 		}
+		moved[i] = newEnt
 		copied++
-
-		// Repoint the index, unless a concurrent write already replaced this
-		// version of the key.
-		s.mu.Lock()
-		if n, ok := s.keys[it.key]; ok && n.ent.seq == it.e.seq && n.ent.fileID == it.e.fileID {
-			n.ent = newEnt
-		}
-		s.mu.Unlock()
 	}
 
 	for _, df := range outs {
@@ -254,6 +264,40 @@ func (s *Store) Compact() error {
 		cleanup()
 		return err
 	}
+
+	// Phase two: the merged files are durable, so the index can be moved onto
+	// them. Repointing in chunks keeps the write lock out of the hands of a
+	// merge that may be walking millions of keys. A key whose sequence has
+	// moved on was rewritten mid-merge and keeps its newer location.
+	const repointChunk = 1024
+	for lo := 0; lo < len(items); lo += repointChunk {
+		hi := min(lo+repointChunk, len(items))
+		s.mu.Lock()
+		for i := lo; i < hi; i++ {
+			if moved[i].size == 0 {
+				continue // never copied: its source file had already gone
+			}
+			if n, ok := s.keys[items[i].key]; ok &&
+				n.ent.seq == items[i].e.seq && n.ent.fileID == items[i].e.fileID {
+				n.ent = moved[i]
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	for lo := 0; lo < len(retired); lo += repointChunk {
+		hi := min(lo+repointChunk, len(retired))
+		s.mu.Lock()
+		for i := lo; i < hi; i++ {
+			if n, ok := s.keys[retired[i].key]; ok &&
+				n.ent.seq == retired[i].e.seq && n.ent.fileID == retired[i].e.fileID {
+				delete(s.keys, n.key)
+				s.order.remove(n.key)
+			}
+		}
+		s.mu.Unlock()
+	}
+
 	// Only now is it safe to say the old tombstones are gone.
 	s.mergeSeq.Store(barrier)
 	if err := writeManifest(s.dir, barrier); err != nil {
@@ -280,15 +324,12 @@ func (s *Store) Compact() error {
 	return nil
 }
 
-// recomputeUsage resets the live/dead accounting from ground truth after a
-// merge, rather than trying to unwind the incremental counters.
+// recomputeUsage resets the accounting from ground truth after a merge, rather
+// than trying to unwind the incremental counters through it.
 func (s *Store) recomputeUsage() {
-	var live int64
-	s.mu.RLock()
-	for _, n := range s.keys {
-		live += int64(n.ent.size)
-	}
-	s.mu.RUnlock()
+	s.mu.Lock()
+	s.recountLocked()
+	s.mu.Unlock()
 
 	var total int64
 	s.fmu.RLock()
@@ -296,13 +337,7 @@ func (s *Store) recomputeUsage() {
 		total += df.size.Load()
 	}
 	s.fmu.RUnlock()
-
-	s.live.Store(live)
-	dead := total - live
-	if dead < 0 {
-		dead = 0
-	}
-	s.dead.Store(dead)
+	s.total.Store(total)
 }
 
 // --- replication sources ----------------------------------------------------
@@ -352,7 +387,9 @@ func (s *Store) rawRecord(key string, e entry) ([]byte, error) {
 			s.fmu.RUnlock()
 			if err == nil {
 				if _, derr := decodeRecord(buf); derr == nil {
-					return buf, nil
+					// The receiver stores this record on its own, outside the
+					// batch it was originally written in.
+					return clearBatchFlags(buf), nil
 				}
 			}
 		}
@@ -382,18 +419,25 @@ func (s *Store) SnapshotRecords(fn func(raw []byte) error) error {
 	cursor, exclusive := "", false
 	for {
 		refs = refs[:0]
+		examined := 0
 		s.mu.RLock()
 		for n := s.order.seek(cursor); n != nil; n = n.next[0] {
 			if exclusive && n.key == cursor {
 				continue
 			}
-			refs = append(refs, ref{key: n.key, e: n.ent})
-			if len(refs) == chunk {
+			// Advance the cursor over tombstones as well as live keys: a run
+			// of deleted keys must not look like the end of the index.
+			cursor, exclusive = n.key, true
+			examined++
+			if !n.ent.tomb {
+				refs = append(refs, ref{key: n.key, e: n.ent})
+			}
+			if len(refs) == chunk || examined == chunk*8 {
 				break
 			}
 		}
 		s.mu.RUnlock()
-		if len(refs) == 0 {
+		if examined == 0 {
 			return nil
 		}
 		for _, r := range refs {
@@ -410,10 +454,6 @@ func (s *Store) SnapshotRecords(fn func(raw []byte) error) error {
 			if err := fn(buf); err != nil {
 				return err
 			}
-		}
-		cursor, exclusive = refs[len(refs)-1].key, true
-		if len(refs) < chunk {
-			return nil
 		}
 	}
 }

@@ -47,6 +47,10 @@ type Client struct {
 	current string
 	next    int
 	closed  bool
+	// poisoned marks a connection abandoned part-way through a multi-frame
+	// reply. The unread frames would otherwise be picked up as the answer to
+	// the next request.
+	poisoned bool
 }
 
 func New(addrs []string, opts Options) (*Client, error) {
@@ -157,7 +161,12 @@ func (c *Client) call(req []byte, handle func(first []byte, r *proto.Reader) err
 			d := proto.NewDec(frame[1:])
 			return &RemoteError{Msg: d.Str()}
 		}
-		return handle(frame, c.r)
+		err = handle(frame, c.r)
+		if c.poisoned {
+			c.dropLocked()
+			c.poisoned = false
+		}
+		return err
 	}
 	if lastErr == nil {
 		lastErr = ErrNoNodes
@@ -275,7 +284,7 @@ func (c *Client) ScanKeyRange(startKey, endKey []byte, limit int, fn func(key, v
 		for {
 			switch proto.Status(frame[0]) {
 			case proto.StatusRangeEnd:
-				return nil
+				return nil // the stream is finished; the connection is reusable
 			case proto.StatusRangeChunk:
 				d := proto.NewDec(frame[1:])
 				for d.Err() == nil && !d.Empty() {
@@ -285,16 +294,22 @@ func (c *Client) ScanKeyRange(startKey, endKey []byte, limit int, fn func(key, v
 						break
 					}
 					if err := fn(k, v); err != nil {
+						// The caller gave up mid-stream; the rest of the
+						// reply is still in flight behind us.
+						c.poisoned = true
 						return err
 					}
 				}
 				if err := d.Err(); err != nil {
+					c.poisoned = true
 					return err
 				}
 			case proto.StatusError:
+				// The server terminated the stream itself, so nothing follows.
 				d := proto.NewDec(frame[1:])
 				return &RemoteError{Msg: d.Str()}
 			default:
+				c.poisoned = true
 				return fmt.Errorf("gokv: unexpected status %#x in range reply", frame[0])
 			}
 			// Extend the deadline: a long range is many frames.
@@ -302,9 +317,11 @@ func (c *Client) ScanKeyRange(startKey, endKey []byte, limit int, fn func(key, v
 			var err error
 			frame, err = r.ReadFrame()
 			if err != nil {
+				c.poisoned = true
 				return err
 			}
 			if len(frame) == 0 {
+				c.poisoned = true
 				return proto.ErrMalformed
 			}
 		}

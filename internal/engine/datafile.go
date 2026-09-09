@@ -23,14 +23,22 @@ const (
 	hintHeaderSize = 25
 )
 
-// entry is what the in-memory index stores per live key: enough to find the
-// record on disk and nothing else. 24 bytes plus the key itself, which is what
-// keeps a dataset far larger than RAM addressable.
+// entry is what the in-memory index stores per key: enough to find the record
+// on disk and nothing else. A small fixed-size locator plus the key itself is
+// what keeps a dataset far larger than RAM addressable.
+//
+// Deleted keys keep an entry too, with tomb set. That costs memory until the
+// next compaction, and it buys the invariant everything else depends on: the
+// index always knows the sequence number of the newest record it has seen for
+// a key, so an older record arriving later -- out of a merged file during
+// recovery, or out of order on a replication stream -- can be recognised as
+// stale instead of resurrecting a deleted key.
 type entry struct {
 	pos    int64  // byte offset of the record inside its data file
 	seq    uint64 // sequence number of the record
 	fileID uint32
 	size   uint32 // full encoded record size
+	tomb   bool   // the record is a tombstone
 }
 
 type datafile struct {
@@ -232,6 +240,35 @@ func readHint(dir string, id uint32, fn func(key []byte, e entry, flags uint8)) 
 			fileID: id,
 		}, hdr[8])
 	}
+}
+
+// removeOrphanHints deletes hint files with no matching data file, and any
+// half-written temporary hint left behind by a crash.
+func removeOrphanHints(dir string, dataIDs []uint32) error {
+	live := make(map[uint32]bool, len(dataIDs))
+	for _, id := range dataIDs {
+		live[id] = true
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(name, hintSuffix+".tmp"):
+			os.Remove(filepath.Join(dir, name))
+		case strings.HasSuffix(name, hintSuffix):
+			n, err := strconv.ParseUint(strings.TrimSuffix(name, hintSuffix), 10, 32)
+			if err != nil || !live[uint32(n)] {
+				os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
+	return nil
 }
 
 func hintExists(dir string, id uint32) bool {

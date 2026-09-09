@@ -66,8 +66,10 @@ scripts/crash_test.sh interval   # reports what a crash costs in the fast mode
 ```
 
 Every write is an append to the tail of the log. The in-memory index holds only
-the key and a 24-byte locator, so the values — the bulk of the data — never need
-to fit in RAM. A read is one map lookup plus one `pread`. Recovery replays the
+the key and a 32-byte locator, so the values — the bulk of the data — never need
+to fit in RAM. Deleted keys keep a tombstone entry until the next compaction, so
+that "newest sequence wins" can be applied to every record, whatever order it
+arrives in. A read is one map lookup plus one `pread`. Recovery replays the
 log, or the compact `.hint` sidecars when they exist. Background compaction
 merges the immutable files and drops superseded records.
 

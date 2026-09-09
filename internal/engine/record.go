@@ -144,3 +144,22 @@ func scanFile(path string, fn func(pos int64, raw []byte, r *record) error) (int
 		pos += int64(size)
 	}
 }
+
+// clearBatchFlags strips the BatchPut markers from an encoded record,
+// re-checksumming only when it has to.
+//
+// The markers mean "this record is part of a group that is only valid once its
+// terminator is seen". That is true where the batch was written, but it stops
+// being true the moment a record is lifted out of that context -- copied into a
+// merged file by compaction, or shipped alone in a replication snapshot -- and
+// a terminator that has since been overwritten will never accompany it again.
+// Recovery would then stage those records forever and discard them.
+func clearBatchFlags(raw []byte) []byte {
+	if len(raw) < recordHeaderSize || raw[20]&(flagBatch|flagBatchEnd) == 0 {
+		return raw
+	}
+	out := append([]byte(nil), raw...)
+	out[20] &^= flagBatch | flagBatchEnd
+	binary.LittleEndian.PutUint32(out[0:4], crc32.ChecksumIEEE(out[4:]))
+	return out
+}

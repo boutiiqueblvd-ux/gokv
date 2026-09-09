@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,11 @@ type Config struct {
 	Peers     []string // every node in the cluster, including this one
 	Bootstrap bool     // start life as the leader
 	Leader    string   // initial leader address for a follower
+
+	// Listener, when set, is used instead of binding Addr. It lets a
+	// supervisor (or a test) reserve the port before the node starts, so
+	// nothing can take it in between.
+	Listener net.Listener
 
 	Engine            engine.Options
 	HeartbeatInterval time.Duration // leader -> follower keepalive
@@ -167,10 +173,14 @@ func (n *Node) logf(format string, args ...any) { n.cfg.Logger.Printf(format, ar
 
 // Start begins listening and launches the background replication machinery.
 func (n *Node) Start() error {
-	ln, err := net.Listen("tcp", n.cfg.Addr)
-	if err != nil {
-		n.store.Close()
-		return err
+	ln := n.cfg.Listener
+	if ln == nil {
+		var err error
+		ln, err = net.Listen("tcp", n.cfg.Addr)
+		if err != nil {
+			n.store.Close()
+			return err
+		}
 	}
 	n.ln = ln
 	n.logf("listening on %s as %s (epoch %d, %d keys)", ln.Addr(), n.Role(), n.Epoch(), n.store.Len())
@@ -383,15 +393,26 @@ func (n *Node) handle(op proto.Op, d *proto.Dec, w *proto.Writer) error {
 		if d.Err() != nil {
 			return writeError(w, d.Err())
 		}
+		// Each pair needs at least two 4-byte length prefixes, so a count that
+		// the remaining body cannot possibly hold is a malformed (or hostile)
+		// frame. Checking it before allocating stops a bogus count from
+		// reserving gigabytes.
+		if count < 0 || count > d.Remaining()/8 {
+			return writeError(w, fmt.Errorf("batch count %d does not fit in %d remaining bytes", count, d.Remaining()))
+		}
 		keys := make([][]byte, 0, count)
 		vals := make([][]byte, 0, count)
 		for i := 0; i < count; i++ {
+			// These alias the frame buffer, which stays valid until the next
+			// ReadFrame -- i.e. past this call. Copying a 300 MiB batch just
+			// to hand it to a writer that encodes it immediately would double
+			// the peak memory for no gain.
 			k, v := d.Bytes(), d.Bytes()
 			if d.Err() != nil {
 				return writeError(w, d.Err())
 			}
-			keys = append(keys, append([]byte(nil), k...))
-			vals = append(vals, append([]byte(nil), v...))
+			keys = append(keys, k)
+			vals = append(vals, v)
 		}
 		if err := d.Done(); err != nil {
 			return writeError(w, err)
@@ -504,12 +525,23 @@ func encodePairs(pairs []pair) *proto.Enc {
 	return e
 }
 
+// heapBytes reads live heap size without stopping the world. runtime.MemStats
+// would, and STATS is reachable by any client -- polling it must not be a way
+// to add pauses to everyone else's latency.
+func heapBytes() uint64 {
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(sample)
+	if sample[0].Value.Kind() == metrics.KindUint64 {
+		return sample[0].Value.Uint64()
+	}
+	return 0
+}
+
 func (n *Node) statPairs() []pair {
 	s := n.store.Stats()
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
 	return []pair{
 		{"keys", strconv.Itoa(s.Keys)},
+		{"tombstones", strconv.Itoa(s.Tombstones)},
 		{"files", strconv.Itoa(s.Files)},
 		{"live_bytes", strconv.FormatInt(s.LiveBytes, 10)},
 		{"dead_bytes", strconv.FormatInt(s.DeadBytes, 10)},
@@ -523,7 +555,7 @@ func (n *Node) statPairs() []pair {
 		{"misses", strconv.FormatUint(s.Misses, 10)},
 		{"connections", strconv.FormatInt(n.nConns.Load(), 10)},
 		{"goroutines", strconv.Itoa(runtime.NumGoroutine())},
-		{"heap_bytes", strconv.FormatUint(mem.HeapAlloc, 10)},
+		{"heap_bytes", strconv.FormatUint(heapBytes(), 10)},
 		{"uptime", time.Since(n.startedAt).Round(time.Second).String()},
 	}
 }

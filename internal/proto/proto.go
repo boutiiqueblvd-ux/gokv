@@ -88,6 +88,9 @@ const (
 	StatusReplData  Status = 0x06 // body is one or more raw engine records
 	StatusFullSync  Status = 0x07 // discard local state, a snapshot follows
 	StatusHeartbeat Status = 0x08
+	// StatusLive marks the end of catch-up: everything after it arrives as it
+	// is written, so the follower can go back to a tight liveness deadline.
+	StatusLive Status = 0x09
 )
 
 var (
@@ -252,6 +255,15 @@ func (d *Dec) Done() error {
 		return fmt.Errorf("%w: %d trailing bytes", ErrMalformed, len(d.B)-d.pos)
 	}
 	return nil
+}
+
+// Remaining reports how many bytes of the body are still unread. Handlers use
+// it to sanity-check a count field before allocating anything sized by it.
+func (d *Dec) Remaining() int {
+	if d.err != nil || d.pos > len(d.B) {
+		return 0
+	}
+	return len(d.B) - d.pos
 }
 
 // Empty reports whether the decoder has consumed the whole body.
